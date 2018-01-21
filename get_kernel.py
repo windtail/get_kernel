@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# coding: utf-8
 
 import click
 import os
@@ -9,7 +10,11 @@ class SystemUtilRequiredError(click.ClickException):
     pass
 
 
-class SystemUtilExecError(click.ClickException):
+class DownloadError(click.ClickException):
+    pass
+
+
+class VerifyError(click.ClickException):
     pass
 
 
@@ -29,44 +34,87 @@ def check_prerequisites():
     require("tar")
 
 
+def download(url, filename):
+    if os.system("wget -O %s %s" % (filename, url)) != 0:
+        raise DownloadError("Failed to download %s" % filename)
+
+
+def verify(xzfile, signfile):
+    if os.system("unxz -c %s | gpg --verify %s -" % (xzfile, signfile)) != 0:
+        raise VerifyError(
+            "Failed to verify %s\nYou may run `gpg --search-keys <key>` if you encounter no public key error" % xzfile)
+
+
 def get_single_version(mirror, ver):
-    m = re.match(r"^(\d+\.\d+)", ver)
-    if m is None:
-        raise click.UsageError("Not valid version format: %s" % ver)
-    v = float(m.group(1))
-    if v > 3.0:
-        folder = "v%d.x/" % int(v)
+    if ver.main > 3.0:
+        folder = "v%d.x/" % int(ver.main)
     else:
-        folder = "v%f/" % v
+        folder = "v%.1f/" % ver.main
+
     base_url = mirror + folder
-    sign_name = "linux-%s.tar.sign" % ver
-    kernel_name = "linux-%s.tar.xz" % ver
+    sign_name = "linux-%s.tar.sign" % ver.full
+    kernel_name = "linux-%s.tar.xz" % ver.full
 
-    if os.system("wget %s%s" % (base_url, sign_name)) != 0:
-        raise click.SystemUtilExecError("Downloading %s failed" % sign_name)
+    download(base_url + sign_name, sign_name)
+    download(base_url + kernel_name, kernel_name)
+    verify(kernel_name, sign_name)
 
-    if os.system("wget %s%s" % (base_url, kernel_name)) != 0:
-        raise click.SystemUtilExecError("Downloading %s failed" % kernel_name)
 
-    if os.system("unxz -c %s | gpg --verify %s -" % (kernel_name, sign_name)) != 0:
-        raise click.SystemUtilExecError(
-            "Verifing %s failed\nYou may want to gpg --search-keys [keys without public]" % kernel_name)
+class KernelVersion(object):
+    def __init__(self, ver):
+        m = re.match("^(\d+\.\d+)", ver)
+        assert m is not None
+
+        self.main = float(m.group(1))
+        self.full = ver
+
+    def __str__(self):
+        return self.full
+
+
+class KernelVersionParamType(click.ParamType):
+    name = 'kernel_version'
+
+    def convert(self, value, param, ctx):
+        m = re.match("^(\d+\.\d+)", value)
+        if m is None:
+            self.fail("%s is not a valid kernel version" % value, param, ctx)
+        return value
+
+
+KERNEL_VERSION = KernelVersionParamType()
+
+
+class MirrorParamType(click.ParamType):
+    name = 'mirror'
+
+    def __init__(self):
+        self.known_mirrors = {"tsinghua": "https://mirrors.tuna.tsinghua.edu.cn/kernel/",
+                              "default": "https://cdn.kernel.org/pub/linux/kernel/"}
+
+    def convert(self, value, param, ctx):
+        if value in self.known_mirrors:
+            return self.known_mirrors[value]
+        if re.match(r"^(https|http|ftp)://[^/]", value) is None:
+            self.fail("Mirror should be valid https/http/ftp URL or known mirrors' name\n"
+                      "All known_mirrors are %s" % ",".join(self.known_mirrors), param, ctx)
+        if not value.endswith("/"):
+            return value + "/"
+        else:
+            return value
+
+
+MIRROR = MirrorParamType()
 
 
 @click.command("Get specific kernel version and verify")
-@click.option("--mirror", "-m", help="mirror url or name, by default downloading from kernel.org", default="official")
-@click.argument("versions", nargs=-1)
+@click.option("--mirror", "-m", type=MIRROR, help="mirror name or URL, default kernel.org", default="default")
+@click.argument("versions", nargs=-1, type=KERNEL_VERSION)
 def cli(mirror, versions):
     check_prerequisites()
-    known_mirrors = {"tsinghua": "https://mirrors.tuna.tsinghua.edu.cn/kernel/",
-                     "official": "https://cdn.kernel.org/pub/linux/kernel/"}
-    if mirror in known_mirrors:
-        mirror = known_mirrors[mirror]
-    elif re.match(r"^(https|http|ftp)://.*/$", mirror) is None:
-        raise click.UsageError("Not valid mirror url format")
 
     for ver in versions:
-        get_single_version(mirror, ver)
+        get_single_version(mirror, KernelVersion(ver))
 
     if len(versions) > 0:
         click.echo("Kernel %s ready" % ",".join(versions))
